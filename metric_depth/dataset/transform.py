@@ -202,6 +202,168 @@ class Resize(object):
 
         # print(sample['image'].shape, sample['depth'].shape)
         return sample
+    
+class ResizeTensor(object):
+    """Resize sample to given size (width, height) for torch tensors.
+    """
+
+    def __init__(
+        self,
+        width,
+        height,
+        resize_target=True,
+        keep_aspect_ratio=False,
+        ensure_multiple_of=1,
+        resize_method="lower_bound",
+        image_interpolation_method="bilinear",
+    ):
+        """Init.
+
+        Args:
+            width (int): desired output width
+            height (int): desired output height
+            resize_target (bool, optional):
+                True: Resize the full sample (image, mask, target).
+                False: Resize image only.
+                Defaults to True.
+            keep_aspect_ratio (bool, optional):
+                True: Keep the aspect ratio of the input sample.
+                Output sample might not have the given width and height, and
+                resize behaviour depends on the parameter 'resize_method'.
+                Defaults to False.
+            ensure_multiple_of (int, optional):
+                Output width and height is constrained to be multiple of this parameter.
+                Defaults to 1.
+            resize_method (str, optional):
+                "lower_bound": Output will be at least as large as the given size.
+                "upper_bound": Output will be at max as large as the given size. (Output size might be smaller than given size.)
+                "minimal": Scale as least as possible.  (Output size might be smaller than given size.)
+                Defaults to "lower_bound".
+            image_interpolation_method (str, optional):
+                Interpolation method for resizing images. Defaults to "bilinear".
+        """
+        self.__width = width
+        self.__height = height
+
+        self.__resize_target = resize_target
+        self.__keep_aspect_ratio = keep_aspect_ratio
+        self.__multiple_of = ensure_multiple_of
+        self.__resize_method = resize_method
+        self.__image_interpolation_method = image_interpolation_method
+
+    def constrain_to_multiple_of(self, x, min_val=0, max_val=None):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        y = (torch.round(x / self.__multiple_of) * self.__multiple_of).int()
+
+        if max_val is not None and y > max_val:
+            y = (torch.floor(x / self.__multiple_of) * self.__multiple_of).int()
+
+        if y < min_val:
+            y = (torch.ceil(x / self.__multiple_of) * self.__multiple_of).int()
+
+        return y
+
+    def get_size(self, width, height):
+        # determine new height and width
+        scale_height = self.__height / height
+        scale_width = self.__width / width
+
+        if self.__keep_aspect_ratio:
+            if self.__resize_method == "lower_bound":
+                # scale such that output size is lower bound
+                if scale_width > scale_height:
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            elif self.__resize_method == "upper_bound":
+                # scale such that output size is upper bound
+                if scale_width < scale_height:
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            elif self.__resize_method == "minimal":
+                # scale as least as possible
+                if abs(1 - scale_width) < abs(1 - scale_height):
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            else:
+                raise ValueError(
+                    f"resize_method {self.__resize_method} not implemented"
+                )
+
+        if self.__resize_method == "lower_bound":
+            new_height = self.constrain_to_multiple_of(
+                scale_height * height, min_val=self.__height
+            )
+            new_width = self.constrain_to_multiple_of(
+                scale_width * width, min_val=self.__width
+            )
+        elif self.__resize_method == "upper_bound":
+            new_height = self.constrain_to_multiple_of(
+                scale_height * height, max_val=self.__height
+            )
+            new_width = self.constrain_to_multiple_of(
+                scale_width * width, max_val=self.__width
+            )
+        elif self.__resize_method == "minimal":
+            new_height = self.constrain_to_multiple_of(scale_height * height)
+            new_width = self.constrain_to_multiple_of(scale_width * width)
+        else:
+            raise ValueError(f"resize_method {self.__resize_method} not implemented")
+
+        return (new_width, new_height)
+
+    def __call__(self, sample):
+        width, height = self.get_size(
+            sample["image"].shape[1], sample["image"].shape[0]
+        )
+        
+        # resize sample
+        import pdb; pdb.set_trace()
+        sample["image"] = F.interpolate(
+            sample["image"],
+            size=(height, width),
+            mode=self.__image_interpolation_method,
+            align_corners=False,
+        ).squeeze(0)
+
+        if self.__resize_target:
+            if "disparity" in sample:
+                sample["disparity"] = F.interpolate(
+                    sample["disparity"],
+                    size=(height, width),
+                    mode="nearest",
+                ).squeeze(0)
+
+            if "depth" in sample:
+                sample["depth"] = F.interpolate(
+                    sample["depth"],
+                    size=(height, width),
+                    mode="nearest",
+                ).squeeze(0)
+
+            if "semseg_mask" in sample:
+                sample["semseg_mask"] = F.interpolate(
+                    sample["semseg_mask"].float(),
+                    size=(height, width),
+                    mode="nearest",
+                ).squeeze(0).long()
+
+            if "mask" in sample:
+                sample["mask"] = F.interpolate(
+                    sample["mask"].float(),
+                    size=(height, width),
+                    mode="nearest",
+                ).squeeze(0).bool()
+
+        return sample
 
 
 class NormalizeImage(object):
@@ -242,7 +404,27 @@ class PrepareForNet(object):
             sample["semseg_mask"] = np.ascontiguousarray(sample["semseg_mask"])
 
         return sample
+    
+class PrepareForNetTensor(object):
+    """Prepare sample for usage as network input for torch tensors.
+    """
 
+    def __init__(self):
+        pass
+
+    def __call__(self, sample):
+        sample["image"] = sample["image"].permute(2, 0, 1).contiguous().float()
+
+        if "mask" in sample:
+            sample["mask"] = sample["mask"].float().contiguous()
+        
+        if "depth" in sample:
+            sample["depth"] = sample["depth"].float().contiguous()
+            
+        if "semseg_mask" in sample:
+            sample["semseg_mask"] = sample["semseg_mask"].float().contiguous()
+
+        return sample
 
 class Crop(object):
     """Crop sample for batch-wise training. Image is of shape CxHxW

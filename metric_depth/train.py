@@ -47,7 +47,7 @@ def main():
     
     logger = init_log('global', logging.INFO)
     logger.propagate = 0
-    
+    import pdb; pdb.set_trace()
     rank, world_size = setup_distributed(port=args.port)
     
     if rank == 0:
@@ -122,7 +122,7 @@ def main():
             optimizer.zero_grad()
             
             img, depth, valid_mask = sample['image'].cuda(), sample['depth'].cuda(), sample['valid_mask'].cuda()
-            
+            import pdb; pdb.set_trace()
             if random.random() < 0.5:
                 img = img.flip(-1)
                 depth = depth.flip(-1)

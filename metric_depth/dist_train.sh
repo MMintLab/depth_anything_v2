@@ -3,7 +3,7 @@ now=$(date +"%Y%m%d_%H%M%S")
 
 epoch=120
 bs=4
-gpus=8
+gpus=1
 lr=0.000005
 encoder=vitl
 dataset=hypersim # vkitti

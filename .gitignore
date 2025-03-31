@@ -1,0 +1,7 @@
+/assets
+/checkpoints
+/metric_depth/assets
+/metric_depth/exp
+/metric_depth/results
+/metric_depth/results_backup
+/metric_depth/wandb
