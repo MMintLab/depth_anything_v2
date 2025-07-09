@@ -146,8 +146,22 @@ class DPTHead(nn.Module):
         out = F.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
         out = self.scratch.output_conv2(out)
         
-        return out
+        return out, path_1
 
+class MaskHead(nn.Module):
+    def __init__(self, features=64, output_channels=1):
+        super().__init__()
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(features, features // 2, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(features // 2, output_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, feature_map, output_size):
+        out = F.interpolate(feature_map, size=output_size, mode="bilinear", align_corners=True)
+        out = self.mask_head(out)
+        return out
 
 class DepthAnythingV2(nn.Module):
     def __init__(
@@ -157,7 +171,8 @@ class DepthAnythingV2(nn.Module):
         out_channels=[256, 512, 1024, 1024], 
         use_bn=False, 
         use_clstoken=False,
-        max_depth=20.0
+        max_depth=20.0,
+        mask_prediction=False,
     ):
         super(DepthAnythingV2, self).__init__()
         
@@ -169,20 +184,28 @@ class DepthAnythingV2(nn.Module):
         }
         
         self.max_depth = max_depth
+        self.mask_prediction = mask_prediction
         
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
         
         self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken)
+        self.mask_head = MaskHead(features=64)
     
     def forward(self, x):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
         
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
         
-        depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
-        
-        return depth.squeeze(1)
+        depth, features_for_mask = self.depth_head(features, patch_h, patch_w)
+        depth = depth * self.max_depth
+
+        if self.mask_prediction:
+            # import pdb; pdb.set_trace()
+            mask_out = self.mask_head(features_for_mask, output_size=(patch_h * 14, patch_w * 14))
+            return depth.squeeze(1), mask_out.squeeze(1)
+        else:
+            return depth.squeeze(1), None
     
     @torch.no_grad()
     def infer_image(self, raw_image, input_size=518):

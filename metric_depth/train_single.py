@@ -17,7 +17,7 @@ import torchvision.utils as vutils
 from dataset.hypersim import Hypersim
 from dataset.kitti import KITTI
 from dataset.vkitti2 import VKITTI2
-from dataset.tactile import BUBBLES, GELSLIMS
+from dataset.tactile import BUBBLES, BUBBLES_CROPPED,GELSLIMS, DIGITS
 from depth_anything_v2.dpt import DepthAnythingV2
 from util.loss import SiLogLoss
 from util.metric import eval_depth
@@ -26,7 +26,7 @@ from util.utils import init_log
 parser = argparse.ArgumentParser(description='Depth Anything V2 for Metric Depth Estimation')
 
 parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
-parser.add_argument('--dataset', default='hypersim', choices=['hypersim', 'vkitti', 'bubbles', 'gelslims'])
+parser.add_argument('--dataset', default='hypersim', choices=['hypersim', 'vkitti', 'bubbles', 'gelslims', 'bubbles_cropped', 'digits'])
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=-0.001, type=float)
 parser.add_argument('--max-depth', default=20, type=float)
@@ -36,6 +36,7 @@ parser.add_argument('--lr', default=0.000005, type=float)
 parser.add_argument('--pretrained-from', type=str)
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--masked', action='store_true')
+parser.add_argument('--mask_prediction', action='store_true')
 parser.add_argument('--scale', default=1, type=float)
 
 def main():
@@ -51,8 +52,8 @@ def main():
     logger = init_log('global', logging.INFO)
     logger.propagate = 0
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cuda:1")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda:3")
     
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
@@ -64,16 +65,21 @@ def main():
     cudnn.enabled = True
     cudnn.benchmark = True
     
-    train_tools = ['pattern_02_2_lines_angle_2',
-             'pattern_33',
-             'pattern_03_2_lines_angle_3',
-             'pattern_37',
-             'pattern_01_2_lines_angle_1',
-             'pattern_32',
-             'pattern_06_5_lines_angle_1',
-             'pattern_04_3_lines_angle_1',
-             'pattern_31_rod']
-
+    train_tools = [
+            #  'pattern_02_2_lines_angle_2',
+            #  'pattern_33',
+            #  'pattern_03_2_lines_angle_3',
+            #  'pattern_37',
+            #  'pattern_01_2_lines_angle_1',
+            #  'pattern_32',
+            #  'pattern_06_5_lines_angle_1',
+            #  'pattern_04_3_lines_angle_1',
+            #  'pattern_31_rod',
+             '5mm_ball',
+            #  '5mm_balls',
+            #  '10mm_balls'
+            ]
+            
     test_tools = ['pattern_05_3_lines_angle_2', 'pattern_35', 'pattern_36']
 
     size = (args.img_size, args.img_size)
@@ -85,7 +91,11 @@ def main():
         trainset = BUBBLES('/home/samanta/T2D2/data/train_evaluation/bubbles', 'train', train_tools, size=size, masked=args.masked, scale=args.scale)
     elif args.dataset == 'gelslims':
         trainset = GELSLIMS('/home/samanta/T2D2/data/train_evaluation/gelslims_undistorted', 'train', train_tools, size=size, masked=args.masked, scale=args.scale)
-    else:
+    elif args.dataset == 'bubbles_cropped':
+        trainset = BUBBLES_CROPPED('/home/samanta/T2D2/data/train_evaluation/bubbles', 'train', train_tools, size=size, masked=args.masked, scale=args.scale)
+    elif args.dataset == 'digits':
+        trainset = DIGITS('/home/samanta/T2D2/data/train_evaluation/digits', 'train', train_tools, size=size, masked=args.masked, scale=args.scale)
+    else:    
         raise NotImplementedError
     
     trainloader = DataLoader(trainset, batch_size=args.bs, pin_memory=True, num_workers=4, drop_last=True, shuffle=True)
@@ -109,7 +119,7 @@ def main():
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
         'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
-    model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
+    model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth, 'mask_prediction': args.mask_prediction})
     
     if args.pretrained_from:
         model.load_state_dict(torch.load(args.pretrained_from, map_location='cpu'), strict=False)
@@ -117,14 +127,13 @@ def main():
     model.to(device)
     
     criterion = SiLogLoss().to(device)
+    criterion_mask = torch.nn.BCELoss()
     
     # optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01)
 
     optimizer = AdamW([{'params': [param for name, param in model.named_parameters() if 'pretrained' in name], 'lr': args.lr},
                        {'params': [param for name, param in model.named_parameters() if 'pretrained' not in name], 'lr': args.lr * 10.0}],
                       lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01)
-    
-    import pdb; pdb.set_trace()
     
     total_iters = args.epochs * len(trainloader)
 
@@ -136,6 +145,8 @@ def main():
         
         model.train()
         total_loss = 0
+        depth_loss = 0
+        mask_loss = 0
         
         for i, (sample_r, sample_l) in enumerate(trainloader):
             optimizer.zero_grad()
@@ -145,34 +156,49 @@ def main():
             img = torch.cat([img_r, img_l], dim=0)
             depth = torch.cat([depth_r, depth_l], dim=0)
             valid_mask = torch.cat([valid_mask_r, valid_mask_l], dim=0)
+            valid_mask = (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth)
 
             if random.random() < 0.5:
                 img = img.flip(-1)
                 depth = depth.flip(-1)
                 valid_mask = valid_mask.flip(-1)
             
-            pred = model(img)
-            loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth))
+            pred_depth, pred_mask = model(img)
+            loss_depth = criterion(pred_depth, depth, valid_mask)
+
+            if args.mask_prediction:
+                loss_mask = criterion_mask(pred_mask, valid_mask.float())
+                loss = loss_depth + 0.1*loss_mask
+            else:
+                loss_mask = 0
+                loss = loss_depth
             
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
+            depth_loss += loss_depth.item()
+            mask_loss += loss_mask.item()
 
             # TODO: Add lr scheduler if needed
             
             if i % 100 == 0:
-                logger.info(f'Iter {i}/{len(trainloader)}, Loss: {loss.item():.4f}')
+                logger.info(f'Iter {i}/{len(trainloader)}, Loss: {loss.item():.4f}, Depth Loss: {loss_depth.item():.4f}, Mask Loss: {loss_mask.item():.4f}')
+                
         
         with torch.no_grad():
             img_grid = vutils.make_grid(img.cpu(), normalize=True, scale_each=True)
-            pred_grid = vutils.make_grid(pred.unsqueeze(1).cpu(), normalize=True, scale_each=True)
+            pred_grid = vutils.make_grid(pred_depth.unsqueeze(1).cpu(), normalize=True, scale_each=True)
             depth_grid = vutils.make_grid(depth.unsqueeze(1).cpu(), normalize=True, scale_each=True)
+            pred_mask_grid = vutils.make_grid(pred_mask.unsqueeze(1).cpu(), normalize=True, scale_each=True)
+            mask_grid = vutils.make_grid(valid_mask.float().unsqueeze(1).cpu(), normalize=True, scale_each=True)
             wandb.log(data = {"Input Image": wandb.Image(img_grid, caption="Input")})
             wandb.log(data = {"Predicted Depth": wandb.Image(pred_grid, caption="Predicted")})
             wandb.log(data = {"Ground Truth Depth": wandb.Image(depth_grid, caption="Ground Truth")})
-            rmse_error = eval_depth(pred, depth)['rmse']
-            wandb.log({"train_loss": total_loss / len(trainloader), "RMSE Error": rmse_error, "epoch": epoch})
+            wandb.log(data = {"Predicted Mask": wandb.Image(pred_mask_grid, caption="Predicted Mask")})
+            wandb.log(data = {"Ground Truth Mask": wandb.Image(mask_grid, caption="Ground Truth Mask")})
+            rmse_error = eval_depth(pred_depth, depth)['rmse']
+            wandb.log({"train_loss": total_loss / len(trainloader), "depth_loss": depth_loss / len(trainloader), "mask_loss": mask_loss / len(trainloader), "RMSE Error": rmse_error, "epoch": epoch})
 
         torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch}, os.path.join(args.save_path, 'latest.pth'))
         wandb.save(os.path.join(args.save_path, 'latest.pth'))
